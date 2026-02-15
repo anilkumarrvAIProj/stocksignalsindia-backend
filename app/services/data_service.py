@@ -1,115 +1,23 @@
 """
-DataService — fetches stock data directly from NSE India website.
-No yfinance, no jugaad-data — just direct HTTP requests to nseindia.com.
-Works on cloud servers (Render, Railway, etc.)
+DataService — fetches stock data from Fyers API.
+Reliable, works on cloud servers (Render, Railway, etc.)
+Requires FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN environment variables.
 """
 
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta, date
+from fyers_apiv3 import fyersModel
+from datetime import datetime, timedelta
 from typing import Optional
 import asyncio
 import logging
 import time
 import random
-import json
+import os
 
 from app.config import NIFTY50_STOCKS
 
 logger = logging.getLogger(__name__)
-
-
-class NSEFetcher:
-    """Direct NSE India data fetcher using their internal API."""
-    
-    BASE_URL = "https://www.nseindia.com"
-    
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-        })
-        self._cookies_set = False
-    
-    def _set_cookies(self):
-        """Visit NSE homepage first to get cookies (required by NSE)."""
-        if self._cookies_set:
-            return
-        try:
-            r = self.session.get(self.BASE_URL, timeout=10)
-            self._cookies_set = True
-            logger.info("🍪 NSE cookies obtained")
-        except Exception as e:
-            logger.warning(f"Cookie fetch failed: {e}")
-    
-    def get_stock_quote(self, symbol: str) -> Optional[dict]:
-        """Get current quote for a stock from NSE."""
-        self._set_cookies()
-        try:
-            url = f"{self.BASE_URL}/api/quote-equity?symbol={symbol}"
-            r = self.session.get(url, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            logger.debug(f"Quote failed for {symbol}: {e}")
-        return None
-    
-    def get_historical_data(self, symbol: str, days: int = 180) -> Optional[pd.DataFrame]:
-        """Get historical OHLCV data from NSE."""
-        self._set_cookies()
-        
-        end_date = date.today()
-        start_date = end_date - timedelta(days=days)
-        
-        try:
-            url = (
-                f"{self.BASE_URL}/api/historical/cm/equity?"
-                f"symbol={symbol}"
-                f"&series=[%22EQ%22]"
-                f"&from={start_date.strftime('%d-%m-%Y')}"
-                f"&to={end_date.strftime('%d-%m-%Y')}"
-            )
-            r = self.session.get(url, timeout=15)
-            
-            if r.status_code != 200:
-                return None
-            
-            data = r.json()
-            
-            if "data" not in data or not data["data"]:
-                return None
-            
-            rows = []
-            for item in data["data"]:
-                try:
-                    rows.append({
-                        "Date": item.get("CH_TIMESTAMP", ""),
-                        "Open": float(item.get("CH_OPENING_PRICE", 0)),
-                        "High": float(item.get("CH_TRADE_HIGH_PRICE", 0)),
-                        "Low": float(item.get("CH_TRADE_LOW_PRICE", 0)),
-                        "Close": float(item.get("CH_CLOSING_PRICE", 0)),
-                        "Volume": int(item.get("CH_TOT_TRADED_QTY", 0)),
-                        "Prev_Close": float(item.get("CH_PREVIOUS_CLS_PRICE", 0)),
-                    })
-                except (ValueError, TypeError):
-                    continue
-            
-            if not rows:
-                return None
-            
-            df = pd.DataFrame(rows)
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.sort_values("Date").reset_index(drop=True)
-            return df
-            
-        except Exception as e:
-            logger.debug(f"Historical data failed for {symbol}: {e}")
-            return None
 
 
 class DataService:
@@ -120,7 +28,34 @@ class DataService:
         self._last_fetch: Optional[datetime] = None
         self._cache_ttl = timedelta(minutes=5)
         self._custom_symbols: set = set()
-        self._nse = NSEFetcher()
+        self._fyers = None
+        self._init_fyers()
+
+    def _init_fyers(self):
+        """Initialize Fyers API client from environment variables."""
+        client_id = os.environ.get("FYERS_CLIENT_ID", "AZF2T7MBGP-100")
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN", "")
+
+        if not access_token:
+            logger.error("❌ FYERS_ACCESS_TOKEN not set! Add it in Render Environment variables.")
+            return
+
+        try:
+            self._fyers = fyersModel.FyersModel(
+                client_id=client_id,
+                token=access_token,
+                is_async=False,
+                log_path=""
+            )
+            # Test connection
+            profile = self._fyers.get_profile()
+            if profile.get("s") == "ok":
+                logger.info(f"✅ Fyers connected: {profile.get('data', {}).get('name', 'Unknown')}")
+            else:
+                logger.warning(f"⚠ Fyers auth issue: {profile}")
+        except Exception as e:
+            logger.error(f"❌ Fyers init failed: {e}")
+            self._fyers = None
 
     async def initialize(self):
         try:
@@ -136,30 +71,53 @@ class DataService:
         self._last_fetch = datetime.now()
 
     def _fetch_all_sync(self):
+        if not self._fyers:
+            logger.error("❌ Fyers not initialized. Cannot fetch data.")
+            return
+
         total = len(NIFTY50_STOCKS)
-        logger.info(f"📊 Fetching {total} stocks from NSE India...")
-        
+        logger.info(f"📊 Fetching {total} stocks from Fyers API...")
+
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
         success_count = 0
         failed_symbols = []
 
         for i, (nse_symbol, info) in enumerate(NIFTY50_STOCKS.items()):
             try:
-                if i > 0:
-                    time.sleep(random.uniform(0.5, 1.5))
+                # Small delay to respect rate limits
+                if i > 0 and i % 10 == 0:
+                    time.sleep(1)
 
-                # Re-establish cookies every 15 stocks
-                if i % 15 == 0 and i > 0:
-                    self._nse._cookies_set = False
-                    self._nse.session.cookies.clear()
-                    time.sleep(2)
+                # Fyers symbol format: NSE:SYMBOL-EQ
+                fyers_symbol = f"NSE:{nse_symbol}-EQ"
 
-                df = self._nse.get_historical_data(nse_symbol)
+                data = {
+                    "symbol": fyers_symbol,
+                    "resolution": "D",
+                    "date_format": "1",
+                    "range_from": start_date,
+                    "range_to": end_date,
+                    "cont_flag": "1"
+                }
 
-                if df is None or df.empty:
+                response = self._fyers.history(data=data)
+
+                if response.get("s") != "ok" or "candles" not in response:
                     failed_symbols.append(nse_symbol)
-                    if (i + 1) % 10 == 0:
-                        logger.warning(f"[{i+1}/{total}] ❌ {nse_symbol} — no data")
+                    logger.debug(f"[{i+1}/{total}] ❌ {nse_symbol}: {response.get('message', 'No data')}")
                     continue
+
+                candles = response["candles"]
+                if not candles:
+                    failed_symbols.append(nse_symbol)
+                    continue
+
+                # candles format: [[timestamp, open, high, low, close, volume], ...]
+                df = pd.DataFrame(candles, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+                df["Date"] = pd.to_datetime(df["Date"], unit="s")
+                df = df.sort_values("Date").reset_index(drop=True)
 
                 self._ohlcv_cache[nse_symbol] = df.copy()
                 self._process_stock_data(nse_symbol, df, info["name"], info["sector"])
@@ -171,36 +129,38 @@ class DataService:
             except Exception as e:
                 failed_symbols.append(nse_symbol)
                 logger.warning(f"[{i+1}/{total}] ❌ {nse_symbol}: {str(e)[:80]}")
-                time.sleep(1)
-
-        logger.info(f"📊 First pass: {success_count}/{total} loaded")
 
         # Retry failed ones
         if failed_symbols:
             logger.info(f"🔄 Retrying {len(failed_symbols)} failed stocks...")
-            self._nse._cookies_set = False
-            self._nse.session.cookies.clear()
-            time.sleep(3)
-            
-            retry_success = 0
+            time.sleep(2)
             for nse_symbol in failed_symbols:
                 info = NIFTY50_STOCKS.get(nse_symbol)
                 if not info:
                     continue
                 try:
-                    time.sleep(random.uniform(1.5, 3))
-                    df = self._nse.get_historical_data(nse_symbol)
-                    if df is not None and not df.empty:
+                    fyers_symbol = f"NSE:{nse_symbol}-EQ"
+                    data = {
+                        "symbol": fyers_symbol,
+                        "resolution": "D",
+                        "date_format": "1",
+                        "range_from": start_date,
+                        "range_to": end_date,
+                        "cont_flag": "1"
+                    }
+                    response = self._fyers.history(data=data)
+                    if response.get("s") == "ok" and response.get("candles"):
+                        df = pd.DataFrame(response["candles"], columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+                        df["Date"] = pd.to_datetime(df["Date"], unit="s")
+                        df = df.sort_values("Date").reset_index(drop=True)
                         self._ohlcv_cache[nse_symbol] = df.copy()
                         self._process_stock_data(nse_symbol, df, info["name"], info["sector"])
-                        retry_success += 1
+                        success_count += 1
                         logger.info(f"[Retry] ✅ {nse_symbol}")
                 except Exception:
                     pass
 
-            logger.info(f"📊 Retry: +{retry_success} loaded")
-
-        logger.info(f"✅ TOTAL: {len(self._cache)}/{total} stocks ready")
+        logger.info(f"✅ TOTAL: {len(self._cache)}/{total} stocks loaded via Fyers API")
 
     def _process_stock_data(self, symbol: str, df: pd.DataFrame, name: str, sector: str):
         latest = df.iloc[-1]
@@ -209,7 +169,7 @@ class DataService:
         high_52w = df["High"].tail(252).max() if len(df) >= 252 else df["High"].max()
         low_52w = df["Low"].tail(252).min() if len(df) >= 252 else df["Low"].min()
 
-        volume = int(latest["Volume"]) if "Volume" in df.columns and pd.notna(latest.get("Volume")) else 0
+        volume = int(latest["Volume"]) if pd.notna(latest.get("Volume")) else 0
 
         self._cache[symbol] = {
             "symbol": symbol,
@@ -240,22 +200,54 @@ class DataService:
         if symbol in self._cache:
             return self._cache[symbol]
 
+        if not self._fyers:
+            return None
+
         logger.info(f"On-demand fetch: {symbol}")
         try:
-            df = self._nse.get_historical_data(symbol)
-            if df is None or df.empty:
+            fyers_symbol = f"NSE:{symbol}-EQ"
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+            data = {
+                "symbol": fyers_symbol,
+                "resolution": "D",
+                "date_format": "1",
+                "range_from": start_date,
+                "range_to": end_date,
+                "cont_flag": "1"
+            }
+
+            response = self._fyers.history(data=data)
+
+            if response.get("s") != "ok" or not response.get("candles"):
                 return None
 
+            df = pd.DataFrame(response["candles"], columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+            df["Date"] = pd.to_datetime(df["Date"], unit="s")
+            df = df.sort_values("Date").reset_index(drop=True)
+
+            # Try to get company name from quotes
             name = symbol
             sector = "Other"
-
-            # Try to get name from quote
             try:
-                quote = self._nse.get_stock_quote(symbol)
-                if quote and "info" in quote:
-                    name = quote["info"].get("companyName", symbol)
-                    sector = quote["info"].get("industry", "Other")
-            except:
+                quote_data = {"symbols": fyers_symbol}
+                quote_resp = self._fyers.quotes(quote_data)
+                if quote_resp.get("s") == "ok" and quote_resp.get("d"):
+                    q = quote_resp["d"][0]
+                    name = q.get("n", symbol)
+                    # Map sector from short_name
+                    sector_map = {
+                        "Financial Services": "Banking",
+                        "Information Technology": "IT",
+                        "Consumer Defensive": "FMCG",
+                        "Consumer Cyclical": "Consumer",
+                        "Basic Materials": "Metals",
+                        "Communication Services": "Telecom",
+                    }
+                    raw_sector = q.get("v", {}).get("sector", "Other")
+                    sector = sector_map.get(raw_sector, raw_sector) if raw_sector else "Other"
+            except Exception:
                 pass
 
             self._ohlcv_cache[symbol] = df.copy()
