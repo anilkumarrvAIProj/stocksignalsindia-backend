@@ -170,3 +170,4 @@ class DataService:
     @property
     def needs_refresh(self) -> bool:
         return False
+data_service = DataService()

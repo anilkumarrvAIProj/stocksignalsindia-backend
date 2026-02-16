@@ -13,7 +13,7 @@ from app.services.data_service import DataService
 # APPLICATION LIFESPAN — startup/shutdown hooks
 # ============================================================
 
-data_service = DataService()
+
 
 
 @asynccontextmanager
