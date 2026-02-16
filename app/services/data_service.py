@@ -1,23 +1,24 @@
 """
-DataService — fetches stock data from Fyers API.
-Reliable, works on cloud servers (Render, Railway, etc.)
-Requires FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN environment variables.
+DataService — loads pre-fetched stock data from stock_data.json
+No API calls at startup = instant loading on Render.
+Data is fetched daily using fetch_daily_data.py and committed to git.
 """
 
 import pandas as pd
 import numpy as np
-from fyers_apiv3 import fyersModel
+import json
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 import asyncio
 import logging
-import time
-import random
-import os
 
 from app.config import NIFTY50_STOCKS
 
 logger = logging.getLogger(__name__)
+
+# Path to the pre-fetched data file
+DATA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "stock_data.json")
 
 
 class DataService:
@@ -28,34 +29,7 @@ class DataService:
         self._last_fetch: Optional[datetime] = None
         self._cache_ttl = timedelta(minutes=5)
         self._custom_symbols: set = set()
-        self._fyers = None
-        self._init_fyers()
-
-    def _init_fyers(self):
-        """Initialize Fyers API client from environment variables."""
-        client_id = os.environ.get("FYERS_CLIENT_ID", "AZF2T7MBGP-100")
-        access_token = os.environ.get("FYERS_ACCESS_TOKEN", "")
-
-        if not access_token:
-            logger.error("❌ FYERS_ACCESS_TOKEN not set! Add it in Render Environment variables.")
-            return
-
-        try:
-            self._fyers = fyersModel.FyersModel(
-                client_id=client_id,
-                token=access_token,
-                is_async=False,
-                log_path=""
-            )
-            # Test connection
-            profile = self._fyers.get_profile()
-            if profile.get("s") == "ok":
-                logger.info(f"✅ Fyers connected: {profile.get('data', {}).get('name', 'Unknown')}")
-            else:
-                logger.warning(f"⚠ Fyers auth issue: {profile}")
-        except Exception as e:
-            logger.error(f"❌ Fyers init failed: {e}")
-            self._fyers = None
+        self._data_date: str = ""
 
     async def initialize(self):
         try:
@@ -67,100 +41,71 @@ class DataService:
 
     async def refresh_all(self):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._fetch_all_sync)
+        await loop.run_in_executor(None, self._load_from_file)
         self._last_fetch = datetime.now()
 
-    def _fetch_all_sync(self):
-        if not self._fyers:
-            logger.error("❌ Fyers not initialized. Cannot fetch data.")
+    def _load_from_file(self):
+        """Load stock data from pre-fetched JSON file. Instant startup."""
+        
+        # Try multiple paths
+        possible_paths = [
+            DATA_FILE,
+            "stock_data.json",
+            os.path.join(os.getcwd(), "stock_data.json"),
+            "/opt/render/project/src/stock_data.json",
+        ]
+        
+        data_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                data_path = path
+                break
+        
+        if not data_path:
+            logger.error(f"❌ stock_data.json not found! Run fetch_daily_data.py first.")
+            logger.error(f"   Searched: {possible_paths}")
             return
-
-        total = len(NIFTY50_STOCKS)
-        logger.info(f"📊 Fetching {total} stocks from Fyers API...")
-
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
-
-        success_count = 0
-        failed_symbols = []
-
-        for i, (nse_symbol, info) in enumerate(NIFTY50_STOCKS.items()):
-            try:
-                # Small delay to respect rate limits
-                if i > 0 and i % 10 == 0:
-                    time.sleep(1)
-
-                # Fyers symbol format: NSE:SYMBOL-EQ
-                fyers_symbol = f"NSE:{nse_symbol}-EQ"
-
-                data = {
-                    "symbol": fyers_symbol,
-                    "resolution": "D",
-                    "date_format": "1",
-                    "range_from": start_date,
-                    "range_to": end_date,
-                    "cont_flag": "1"
-                }
-
-                response = self._fyers.history(data=data)
-
-                if response.get("s") != "ok" or "candles" not in response:
-                    failed_symbols.append(nse_symbol)
-                    logger.debug(f"[{i+1}/{total}] ❌ {nse_symbol}: {response.get('message', 'No data')}")
-                    continue
-
-                candles = response["candles"]
-                if not candles:
-                    failed_symbols.append(nse_symbol)
-                    continue
-
-                # candles format: [[timestamp, open, high, low, close, volume], ...]
-                df = pd.DataFrame(candles, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-                df["Date"] = pd.to_datetime(df["Date"], unit="s")
-                df = df.sort_values("Date").reset_index(drop=True)
-
-                self._ohlcv_cache[nse_symbol] = df.copy()
-                self._process_stock_data(nse_symbol, df, info["name"], info["sector"])
-                success_count += 1
-
-                if success_count % 10 == 0 or success_count == 1:
-                    logger.info(f"[{i+1}/{total}] ✅ {nse_symbol}: ₹{self._cache[nse_symbol]['price']} ({success_count} loaded)")
-
-            except Exception as e:
-                failed_symbols.append(nse_symbol)
-                logger.warning(f"[{i+1}/{total}] ❌ {nse_symbol}: {str(e)[:80]}")
-
-        # Retry failed ones
-        if failed_symbols:
-            logger.info(f"🔄 Retrying {len(failed_symbols)} failed stocks...")
-            time.sleep(2)
-            for nse_symbol in failed_symbols:
-                info = NIFTY50_STOCKS.get(nse_symbol)
-                if not info:
-                    continue
+        
+        try:
+            with open(data_path, "r") as f:
+                raw = json.load(f)
+            
+            self._data_date = raw.get("fetched_date", "unknown")
+            stocks_data = raw.get("stocks", {})
+            
+            logger.info(f"📂 Loading data from {data_path}")
+            logger.info(f"📅 Data date: {self._data_date}")
+            logger.info(f"📊 Stocks in file: {len(stocks_data)}")
+            
+            success = 0
+            for symbol, stock_info in stocks_data.items():
                 try:
-                    fyers_symbol = f"NSE:{nse_symbol}-EQ"
-                    data = {
-                        "symbol": fyers_symbol,
-                        "resolution": "D",
-                        "date_format": "1",
-                        "range_from": start_date,
-                        "range_to": end_date,
-                        "cont_flag": "1"
-                    }
-                    response = self._fyers.history(data=data)
-                    if response.get("s") == "ok" and response.get("candles"):
-                        df = pd.DataFrame(response["candles"], columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-                        df["Date"] = pd.to_datetime(df["Date"], unit="s")
-                        df = df.sort_values("Date").reset_index(drop=True)
-                        self._ohlcv_cache[nse_symbol] = df.copy()
-                        self._process_stock_data(nse_symbol, df, info["name"], info["sector"])
-                        success_count += 1
-                        logger.info(f"[Retry] ✅ {nse_symbol}")
-                except Exception:
-                    pass
-
-        logger.info(f"✅ TOTAL: {len(self._cache)}/{total} stocks loaded via Fyers API")
+                    candles = stock_info.get("candles", [])
+                    if not candles:
+                        continue
+                    
+                    # Convert candles to DataFrame
+                    # candles: [[timestamp, open, high, low, close, volume], ...]
+                    df = pd.DataFrame(candles, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+                    df["Date"] = pd.to_datetime(df["Date"], unit="s")
+                    df = df.sort_values("Date").reset_index(drop=True)
+                    
+                    name = stock_info.get("name", symbol)
+                    sector = stock_info.get("sector", "Other")
+                    
+                    self._ohlcv_cache[symbol] = df.copy()
+                    self._process_stock_data(symbol, df, name, sector)
+                    success += 1
+                    
+                except Exception as e:
+                    logger.warning(f"❌ Error processing {symbol}: {e}")
+            
+            logger.info(f"✅ {success}/{len(stocks_data)} stocks loaded instantly from file!")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Invalid JSON in stock_data.json: {e}")
+        except Exception as e:
+            logger.error(f"❌ Failed to load stock_data.json: {e}")
 
     def _process_stock_data(self, symbol: str, df: pd.DataFrame, name: str, sector: str):
         latest = df.iloc[-1]
@@ -189,22 +134,48 @@ class DataService:
             "high_52w": round(float(high_52w), 2),
             "low_52w": round(float(low_52w), 2),
             "is_custom": symbol in self._custom_symbols,
+            "data_date": self._data_date,
         }
 
     # ============================================================
-    # ON-DEMAND FETCHING
+    # ON-DEMAND FETCHING (uses Fyers API for stocks not in file)
     # ============================================================
 
+    def _init_fyers(self):
+        """Initialize Fyers client for on-demand fetches."""
+        try:
+            from fyers_apiv3 import fyersModel
+            client_id = os.environ.get("FYERS_CLIENT_ID", "")
+            access_token = os.environ.get("FYERS_ACCESS_TOKEN", "")
+            if client_id and access_token:
+                self._fyers = fyersModel.FyersModel(
+                    client_id=client_id, token=access_token,
+                    is_async=False, log_path=""
+                )
+                logger.info("✅ Fyers API available for on-demand stock lookups")
+            else:
+                self._fyers = None
+                logger.info("ℹ Fyers credentials not set — on-demand lookups disabled")
+        except Exception as e:
+            self._fyers = None
+            logger.warning(f"⚠ Fyers init failed: {e}")
+
     def fetch_on_demand_sync(self, symbol: str) -> Optional[dict]:
+        """Fetch any NSE stock — from cache or Fyers API."""
         symbol = symbol.upper().strip()
         if symbol in self._cache:
             return self._cache[symbol]
 
-        if not self._fyers:
+        # Try Fyers API
+        if not hasattr(self, '_fyers') or self._fyers is None:
+            self._init_fyers()
+
+        if not hasattr(self, '_fyers') or self._fyers is None:
             return None
 
-        logger.info(f"On-demand fetch: {symbol}")
+        logger.info(f"On-demand fetch via Fyers: {symbol}")
         try:
+            from datetime import date
             fyers_symbol = f"NSE:{symbol}-EQ"
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
@@ -221,34 +192,15 @@ class DataService:
             response = self._fyers.history(data=data)
 
             if response.get("s") != "ok" or not response.get("candles"):
+                logger.warning(f"❌ Fyers returned no data for {symbol}: {response.get('message', '')}")
                 return None
 
             df = pd.DataFrame(response["candles"], columns=["Date", "Open", "High", "Low", "Close", "Volume"])
             df["Date"] = pd.to_datetime(df["Date"], unit="s")
             df = df.sort_values("Date").reset_index(drop=True)
 
-            # Try to get company name from quotes
             name = symbol
             sector = "Other"
-            try:
-                quote_data = {"symbols": fyers_symbol}
-                quote_resp = self._fyers.quotes(quote_data)
-                if quote_resp.get("s") == "ok" and quote_resp.get("d"):
-                    q = quote_resp["d"][0]
-                    name = q.get("n", symbol)
-                    # Map sector from short_name
-                    sector_map = {
-                        "Financial Services": "Banking",
-                        "Information Technology": "IT",
-                        "Consumer Defensive": "FMCG",
-                        "Consumer Cyclical": "Consumer",
-                        "Basic Materials": "Metals",
-                        "Communication Services": "Telecom",
-                    }
-                    raw_sector = q.get("v", {}).get("sector", "Other")
-                    sector = sector_map.get(raw_sector, raw_sector) if raw_sector else "Other"
-            except Exception:
-                pass
 
             self._ohlcv_cache[symbol] = df.copy()
             self._custom_symbols.add(symbol)
@@ -290,6 +242,5 @@ class DataService:
 
     @property
     def needs_refresh(self) -> bool:
-        if self._last_fetch is None:
-            return True
-        return datetime.now() - self._last_fetch > self._cache_ttl
+        # No refresh needed — data comes from file
+        return False
