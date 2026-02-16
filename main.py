@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.routers import stocks, indicators, scanner,config
-from app.services.data_service import DataService
+from app.services.data_service import data_service
 
 # ============================================================
 # APPLICATION LIFESPAN — startup/shutdown hooks

@@ -5,7 +5,7 @@ Stocks Router — endpoints for stock list, detail, and zone analysis.
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from app.services.data_service import DataService
+from app.services.data_service import data_service
 from app.services.indicator_service import IndicatorService, INDICATOR_REGISTRY
 
 router = APIRouter()
