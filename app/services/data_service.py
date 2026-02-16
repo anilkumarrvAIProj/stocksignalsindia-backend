@@ -81,7 +81,9 @@ class DataService:
             for symbol, stock_info in stocks_data.items():
                 try:
                     candles = stock_info.get("candles", [])
+			logger.info(f"Processing {symbol}, candle count: {len(candles)}")
                     if not candles:
+			logger.warning(f"No candles for {symbol}")
                         continue
                     
                     # Convert candles to DataFrame
