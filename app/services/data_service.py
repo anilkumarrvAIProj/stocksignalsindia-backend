@@ -244,3 +244,4 @@ class DataService:
     def needs_refresh(self) -> bool:
         # No refresh needed — data comes from file
         return False
+data_service = DataService()
