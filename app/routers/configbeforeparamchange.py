@@ -20,7 +20,6 @@ from app.services.indicator_config import (
 )
 from app.services.data_service import DataService
 from app.services.indicator_service import IndicatorService, INDICATOR_REGISTRY
-from app.services.indicator_config import update_current_config
 
 router = APIRouter()
 data_service = DataService()
