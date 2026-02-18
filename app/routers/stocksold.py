@@ -7,7 +7,6 @@ from typing import Optional
 
 from app.services.data_service import data_service
 from app.services.indicator_service import IndicatorService, INDICATOR_REGISTRY
-from app.routers.config import get_current_user_config
 
 router = APIRouter()
 
@@ -28,15 +27,7 @@ def build_zone_analysis(symbol: str):
         raise HTTPException(status_code=404, detail=f"No OHLCV data for '{symbol}'")
 
     # Compute all indicators
-    current_config = get_current_user_config()
-
-    zone_results = IndicatorService.compute_all(
-    df,
-    stock["price"],
-    stock,
-    config=current_config
-)
-  
+    zone_results = IndicatorService.compute_all(df, stock["price"], stock)
 
     # Build response
     zones = []
