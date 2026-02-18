@@ -6,9 +6,9 @@ from fastapi import APIRouter, HTTPException
 
 from app.services.data_service import DataService
 from app.services.indicator_service import IndicatorService, INDICATOR_REGISTRY
-from app.services.data_service import data_service
-router = APIRouter()
 
+router = APIRouter()
+data_service = DataService()
 
 
 @router.get("/")

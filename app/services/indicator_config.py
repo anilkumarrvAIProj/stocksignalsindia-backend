@@ -566,3 +566,29 @@ def apply_preset(preset_name: str) -> dict:
     if not preset:
         return get_config_with_overrides()
     return get_config_with_overrides(preset["config"])
+# ============================================================
+# RUNTIME CONFIG STORAGE (In-Memory)
+# ============================================================
+
+# Holds current user overrides
+_CURRENT_USER_CONFIG = {}
+
+
+def get_current_config() -> dict:
+    """
+    Return the currently active user configuration.
+    """
+    return _CURRENT_USER_CONFIG
+
+
+def update_current_config(new_config: dict):
+    """
+    Replace current user config with new values.
+    Expected format:
+    {
+        "rsi": {"period": 50},
+        "macd": {"fast_period": 8}
+    }
+    """
+    global _CURRENT_USER_CONFIG
+    _CURRENT_USER_CONFIG = new_config or {}
